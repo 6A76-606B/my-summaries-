@@ -1,0 +1,7 @@
+name = "cold-night-2989"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+keep_vars = true
+
+[triggers]
+crons = ["* * * * *"]
