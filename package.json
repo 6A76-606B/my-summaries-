@@ -10,7 +10,9 @@
     "@capacitor/android": "^6.2.1",
     "@capacitor/core": "^6.2.1",
     "@capacitor/local-notifications": "^6.1.2",
-    "@capacitor/push-notifications": "^6.0.5"
+    "@capacitor/push-notifications": "^6.0.5",
+    "@capacitor-firebase/authentication": "^6.3.0",
+    "firebase": "^10.12.2"
   },
   "devDependencies": {
     "@capacitor/cli": "^6.2.1"

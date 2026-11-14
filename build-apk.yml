@@ -35,6 +35,77 @@ jobs:
             npx cap add android
           fi
 
+      - name: Use fixed signing key and raise minSdk
+        run: |
+          mkdir -p ~/.android
+          cp debug.keystore ~/.android/debug.keystore
+          sed -i 's/minSdkVersion = [0-9]*/minSdkVersion = 24/' android/variables.gradle
+          M=android/app/src/main/AndroidManifest.xml
+          grep -q POST_NOTIFICATIONS "$M" || sed -i 's#<application#<uses-permission android:name="android.permission.POST_NOTIFICATIONS" />\n    <application#' "$M"
+          grep -n "POST_NOTIFICATIONS" "$M"
+          echo "=== SHA-1 / SHA-256 to add in Firebase ==="
+          keytool -list -v -keystore ~/.android/debug.keystore -storepass android -alias androiddebugkey | grep -E "SHA1|SHA256"
+
+      - name: Apply app icon
+        run: |
+          pip install pillow
+          python3 - <<'PY'
+          from PIL import Image, ImageDraw
+          import os
+          RES = 'android/app/src/main/res'
+          src = Image.open('icon.jpg').convert('RGBA')
+          def sized(n, pad):
+              bg = Image.new('RGBA', (n, n), (255, 255, 255, 255))
+              s = int(n * (1 - 2 * pad))
+              bg.alpha_composite(src.resize((s, s), Image.LANCZOS), ((n - s) // 2, (n - s) // 2))
+              return bg
+          def mask(im, kind):
+              n = im.size[0]
+              m = Image.new('L', (n * 4, n * 4), 0)
+              d = ImageDraw.Draw(m)
+              if kind == 'round':
+                  d.ellipse((0, 0, n * 4 - 1, n * 4 - 1), fill=255)
+              else:
+                  d.rounded_rectangle((0, 0, n * 4 - 1, n * 4 - 1), radius=int(n * 4 * 0.22), fill=255)
+              o = im.copy()
+              o.putalpha(m.resize((n, n), Image.LANCZOS))
+              return o
+          legacy = {'mdpi': 48, 'hdpi': 72, 'xhdpi': 96, 'xxhdpi': 144, 'xxxhdpi': 192}
+          fore = {'mdpi': 108, 'hdpi': 162, 'xhdpi': 216, 'xxhdpi': 324, 'xxxhdpi': 432}
+          for k in legacy:
+              d = f'{RES}/mipmap-{k}'
+              os.makedirs(d, exist_ok=True)
+              for f in os.listdir(d):
+                  if f.startswith('ic_launcher'):
+                      os.remove(os.path.join(d, f))
+              n = legacy[k]
+              big = sized(n * 4, 0.04)
+              mask(big, 'rounded').resize((n, n), Image.LANCZOS).save(f'{d}/ic_launcher.png')
+              mask(big, 'round').resize((n, n), Image.LANCZOS).save(f'{d}/ic_launcher_round.png')
+              n = fore[k]
+              c = Image.new('RGBA', (n, n), (0, 0, 0, 0))
+              s = int(n * 0.60)
+              c.alpha_composite(src.resize((s, s), Image.LANCZOS), ((n - s) // 2, (n - s) // 2))
+              c.save(f'{d}/ic_launcher_foreground.png')
+          PY
+          RES=android/app/src/main/res
+          mkdir -p "$RES/values" "$RES/mipmap-anydpi-v26"
+          cat > "$RES/values/ic_launcher_background.xml" <<'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="ic_launcher_background">#FFFFFF</color>
+          </resources>
+          XML
+          for f in ic_launcher ic_launcher_round; do
+            cat > "$RES/mipmap-anydpi-v26/$f.xml" <<'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/ic_launcher_background"/>
+              <foreground android:drawable="@mipmap/ic_launcher_foreground"/>
+          </adaptive-icon>
+          XML
+          done
+
       - name: Add google-services.json and sync
         run: |
           if [ -f "google-services.json" ]; then

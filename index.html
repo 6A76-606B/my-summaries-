@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<script>try{var c=window.Capacitor;if((c&&c.isNativePlatform&&c.isNativePlatform())||(navigator.deviceMemory&&navigator.deviceMemory<=4))document.documentElement.classList.add("lite")}catch(e){}</script>
 <meta name="theme-color" content="#1B2670">
 <meta name="description" content="ملخصات وفيديوهات وامتحانات تانية بكالوريا">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='22' fill='%231B2670'/%3E%3Ctext x='50' y='70' font-size='58' text-anchor='middle' fill='%23E7AE3B'%3E✍%3C/text%3E%3C/svg%3E">
@@ -1339,7 +1340,7 @@ html[data-theme=dark]{--wall:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3
 
 <script type="module">
 import {initializeApp} from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
-import {getAuth,onAuthStateChanged,GoogleAuthProvider,signInWithPopup,signInWithRedirect,signInWithEmailAndPassword,signOut,getRedirectResult}
+import {getAuth,onAuthStateChanged,GoogleAuthProvider,signInWithPopup,signInWithRedirect,signInWithCredential,signInWithEmailAndPassword,signOut,getRedirectResult}
   from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
 import {increment,getFirestore,doc,getDoc,getDocs,setDoc as _setDoc,addDoc as _addDoc,updateDoc as _updateDoc,deleteDoc as _deleteDoc,collection,query,where,orderBy,limit,onSnapshot,serverTimestamp,writeBatch as _writeBatch}
   from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
@@ -1481,13 +1482,30 @@ const sheetHead=t=>`<div class="sheet-h"><span>${t}</span><button class="x" data
    AUTH
    ===================================================================== */
 const authMsg=e=>({'auth/invalid-credential':'الإيميل أو الباسورد غلط','auth/wrong-password':'الإيميل أو الباسورد غلط','auth/user-not-found':'الإيميل أو الباسورد غلط',
-  'auth/too-many-requests':'محاولات كتير، استنى شوية وجرّب تاني','auth/unauthorized-domain':'الدومين ده مش مضاف في Authorized domains في Firebase','auth/network-request-failed':'مفيش اتصال بالإنترنت','auth/operation-not-allowed':'تسجيل الدخول ده مش مفعّل في Firebase (Authentication ← Sign-in method)','auth/invalid-api-key':'مفتاح Firebase غلط','auth/web-storage-unsupported':'المتصفح بيمنع التخزين — افتح من Chrome أو Safari عادي','auth/account-exists-with-different-credential':'الإيميل ده مسجّل بطريقة تانية','auth/user-disabled':'الحساب ده موقوف'}[e.code]||e.code||'حصل خطأ');
+  'auth/too-many-requests':'محاولات كتير، استنى شوية وجرّب تاني','auth/unauthorized-domain':'الدومين ده مش مضاف في Authorized domains في Firebase','auth/network-request-failed':'مفيش اتصال بالإنترنت','auth/operation-not-allowed':'تسجيل الدخول ده مش مفعّل في Firebase (Authentication ← Sign-in method)','auth/invalid-api-key':'مفتاح Firebase غلط','auth/web-storage-unsupported':'المتصفح بيمنع التخزين — افتح من Chrome أو Safari عادي','auth/account-exists-with-different-credential':'الإيميل ده مسجّل بطريقة تانية','auth/user-disabled':'الحساب ده موقوف','auth/no-id-token':'جوجل ما رجّعش بيانات الدخول، جرّب تاني'}[e.code]||e.message||e.code||'حصل خطأ');
 
+const isNative=()=>{try{return !!(window.Capacitor&&window.Capacitor.isNativePlatform&&window.Capacitor.isNativePlatform());}catch{return false;}};
+async function nativeGoogleLogin(){
+  const plug=window.Capacitor&&window.Capacitor.Plugins&&window.Capacitor.Plugins.FirebaseAuthentication;
+  if(!plug){toast('مكوّن تسجيل الدخول مش موجود في التطبيق، ثبّت النسخة الجديدة',true);return;}
+  try{
+    const r=await plug.signInWithGoogle();
+    const idToken=r&&r.credential&&r.credential.idToken;
+    if(!idToken)throw {code:'auth/no-id-token'};
+    await signInWithCredential(auth,GoogleAuthProvider.credential(idToken));
+  }catch(e){
+    const m=String((e&&(e.message||e.code))||'');
+    if(/cancel/i.test(m)||e&&e.code==='12501'||e&&e.code==='SIGN_IN_CANCELLED')return;
+    toast(authMsg(e&&e.code&&String(e.code).startsWith('auth/')?e:{code:'',message:m}),true);
+    console.warn('native google sign-in failed',e);
+  }
+}
 async function googleLogin(){
+  if(isNative())return nativeGoogleLogin();
   const p=new GoogleAuthProvider();p.setCustomParameters({prompt:'select_account'});
   try{await signInWithPopup(auth,p);}
   catch(e){
-    if(['auth/popup-blocked','auth/operation-not-supported-in-this-environment'].includes(e.code))return signInWithRedirect(auth,p);
+    if(['auth/popup-blocked','auth/operation-not-supported-in-this-environment'].includes(e.code)&&!isNative())return signInWithRedirect(auth,p);
     if(!['auth/popup-closed-by-user','auth/cancelled-popup-request'].includes(e.code))toast(authMsg(e),true);
   }
 }
@@ -1503,14 +1521,38 @@ forms['admin-login']=async f=>{
   try{await signInWithEmailAndPassword(auth,f.elements.email.value.trim(),f.elements.pass.value);closeSheet();}
   catch(e){toast(authMsg(e),true);b.disabled=false;}
 };
-acts['logout']=async()=>{closeSheet();location.hash='';await signOut(auth);};
+/* ---------- إشعارات الموبايل (FCM عن طريق الـ Worker) ---------- */
+const PN=()=>window.Capacitor&&window.Capacitor.Plugins&&window.Capacitor.Plugins.PushNotifications;
+let pushTok='',pushInit=false;
+async function wk(path,body){
+  try{if(!WORKER_URL||!me)return;const tk=await me.getIdToken();
+    return await fetch(WORKER_URL.replace(/\/$/,'')+path,{method:'POST',headers:{'Content-Type':'application/json',Authorization:'Bearer '+tk},body:JSON.stringify(body)});}catch{}
+}
+async function setupPush(){
+  const pn=isNative()&&PN();if(!pn||!me)return;
+  try{
+    if(!pushInit){
+      pushInit=true;
+      await pn.addListener('registration',t=>{pushTok=t.value;wk('/register',{token:pushTok});});
+      await pn.addListener('registrationError',e=>console.warn('push registration error',e));
+      await pn.addListener('pushNotificationActionPerformed',a=>{const d=(a&&a.notification&&a.notification.data)||{};const r=admin?(d.aroute||d.route):d.route;if(r)location.hash=r;});
+      try{await pn.createChannel({id:'default',name:'الإشعارات',description:'رسائل الجروب والأدمن',importance:5,visibility:1,vibration:true,lights:true});}catch{}
+    }
+    let pr=await pn.checkPermissions();
+    if(pr.receive==='prompt'||pr.receive==='prompt-with-rationale')pr=await pn.requestPermissions();
+    if(pr.receive==='granted')await pn.register();
+  }catch(e){console.warn('push setup failed',e);}
+}
+const pushTxt=(t,x)=>String(lastOf(t,x)||'').replace(/\s+/g,' ').slice(0,120);
+acts['logout']=async()=>{closeSheet();location.hash='';try{if(pushTok)await wk('/register',{token:pushTok,remove:true});}catch{}await signOut(auth);};
 
-getRedirectResult(auth).catch(e=>{if(e&&e.code)toast(authMsg(e),true);});
+if(!isNative())getRedirectResult(auth).catch(e=>{if(e&&e.code)toast(authMsg(e),true);});
 
 onAuthStateChanged(auth,async u=>{
   if(profUnsub){profUnsub();profUnsub=null;}
   profile=null;gateKey='';progLoaded=false;boardSynced=false;me=u;admin=false;
   if(!u){ready=true;render();return;}
+  setTimeout(setupPush,1200);
   admin=u.emailVerified===true&&(u.email||'').toLowerCase()===ADMIN_EMAIL.toLowerCase();
   if(!admin){try{admin=(await getDoc(doc(db,'admins',u.uid))).exists();}catch{admin=false;}}
   if(!admin&&u.providerData.some(p=>p.providerId==='password')){await signOut(auth);toast('الحساب ده مش أدمن',true);return;}
@@ -1620,7 +1662,7 @@ function studentShell(main,body,pageCls=''){
   }
   app.innerHTML=`<div class="shell">
     <header class="top"><div class="brand"><span class="logo">${icon('i-book')}</span><div><b>My summaries</b><small>${t.name} — تانية بكالوريا</small></div></div>
-      <span style="flex:1"></span>${sndBtn()}${themeBtn()}<button class="avatar-btn" data-act="profile" aria-label="حسابي">${avatar(profile,38)}</button></header>
+      <span style="flex:1"></span>${sndBtn()}${themeBtn()}${devBtn()}<button class="avatar-btn" data-act="profile" aria-label="حسابي">${avatar(profile,38)}</button></header>
     <main class="page ${pageCls}" id="page">${body}</main>
     <nav class="bottom four five">
       <a class="bn ${main==='content'?'on':''}" href="#/content/videos">${icon('i-content')}<span>المحتوى</span></a>
@@ -2358,6 +2400,8 @@ const sndBtn=()=>`<a class="icon-btn wabtn" href="${WA_LINK}" target="_blank" re
 
 /* ---------- theme + follow ---------- */
 const WA_LINK='https://chat.whatsapp.com/EVBWnltUeicEVmNzC4RKpm?s=cl&p=a&mlu=4&ilr=4&iam=2';
+const devBtn=()=>`<button class="icon-btn" data-act="dev" aria-label="المطورين" title="المطورين"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 7l-5 5 5 5M16 7l5 5-5 5M14 4l-4 16"/></svg></button>`;
+acts['dev']=()=>{const o=document.getElementById('ms-dev-overlay');if(o)o.classList.add('ms-open');};
 const themeBtn=()=>`<button class="icon-btn themebtn" data-act="theme" aria-label="تبديل الوضع الفاتح والداكن"><svg class="ic tsun"><use href="#i-sun"/></svg><svg class="ic tmoon"><use href="#i-moon"/></svg></button>`;
 acts['theme']=()=>{
   const r=document.documentElement,n=r.dataset.theme==='dark'?'light':'dark';
@@ -2485,7 +2529,7 @@ function viewCommunity(tab){
     mountChat({q:query(col,orderBy('createdAt','asc'),limit(200)),
       norm:m=>({id:m.id,mine:m.from==='student',name:m.from==='student'?'أنت':'الأدمن',text:m.text,badge:'',t:m.createdAt,...media(m)}),
       send:async(t,x={})=>{await addDoc(col,{from:'student',text:t,createdAt:serverTimestamp(),...x});
-        await setDoc(doc(db,'support_threads',me.uid),{name:profile.name,last:lastOf(t,x).slice(0,80),updatedAt:serverTimestamp(),unread:true,unreadCount:increment(1)},{merge:true});},
+        await setDoc(doc(db,'support_threads',me.uid),{name:profile.name,last:lastOf(t,x).slice(0,80),updatedAt:serverTimestamp(),unread:true,unreadCount:increment(1)},{merge:true});wk('/notify',{kind:'support_to_admin',title:'رسالة من '+(profile.name||'طالب'),body:pushTxt(t,x),route:'#/admin/inbox/'+me.uid,aroute:'#/admin/inbox/'+me.uid,senderUid:me.uid});},
       emptyMsg:'ابعت سؤالك أو مشكلتك والأدمن هيرد عليك هنا.',snd:'notify'});
   }
 }
@@ -2502,7 +2546,7 @@ function adminShell(active,body,pageCls=''){
     <header class="top"><a class="icon-btn" href="#/admin/students" aria-label="رجوع">${icon('i-back')}</a><b class="ttl">الجروب</b><span class="sp"></span>${sndBtn()}${themeBtn()}${pageCls.includes('grpadmin')?`<button class="icon-btn" data-act="grp-menu" aria-label="المزيد">${icon('i-more')}</button>`:''}</header>
     <main class="page ${pageCls}" id="page">${body}</main></div>`:`<div class="shell adm">
     <header class="top"><div class="brand"><div><b>My summaries</b><small>${lbl[active]||'لوحة الأدمن'}</small></div></div>
-      ${sndBtn()}${themeBtn()}<button class="icon-btn" data-act="view-as" aria-label="اعرض كطالب" title="اعرض كطالب">👁</button><button class="icon-btn" data-act="logout" aria-label="خروج">${icon('i-out')}</button></header>
+      ${sndBtn()}${themeBtn()}${devBtn()}<button class="icon-btn" data-act="view-as" aria-label="اعرض كطالب" title="اعرض كطالب">👁</button><button class="icon-btn" data-act="logout" aria-label="خروج">${icon('i-out')}</button></header>
     <main class="page ${pageCls}" id="page">${body}</main>
     <nav class="bottom four ${nav.length>5?'six':'five'}">${nav.map(([k,l,ic])=>`<a class="bn ${k===active||(k==='more'&&sub.includes(active))?'on':''}" href="#/admin/${k}${k==='content'?'/videos':''}">${icon(ic)}<span>${l}</span>${k==='inbox'||k==='group'||k==='more'?`<i class="cnt" id="cnt-${k}" hidden></i>`:''}</a>`).join('')}</nav></div>`;
   let nf=true;
@@ -3009,7 +3053,7 @@ function viewAdminThread(uid){
   const col=collection(db,'support_threads',uid,'messages');
   mountChat({q:query(col,orderBy('createdAt','asc'),limit(200)),
     norm:m=>({id:m.id,mine:m.from==='admin',name:m.from==='admin'?'أنت (الأدمن)':'الطالب',text:m.text,badge:'',t:m.createdAt,...media(m)}),
-    send:async(t,x={})=>{await addDoc(col,{from:'admin',text:t,createdAt:serverTimestamp(),...x});await setDoc(doc(db,'support_threads',uid),{last:'الأدمن: '+lastOf(t,x).slice(0,70),updatedAt:serverTimestamp(),unread:false,unreadCount:0},{merge:true});},
+    send:async(t,x={})=>{await addDoc(col,{from:'admin',text:t,createdAt:serverTimestamp(),...x});await setDoc(doc(db,'support_threads',uid),{last:'الأدمن: '+lastOf(t,x).slice(0,70),updatedAt:serverTimestamp(),unread:false,unreadCount:0},{merge:true});wk('/notify',{kind:'support_to_student',uid,title:'رد جديد من الأدمن',body:pushTxt(t,x),route:'#/community/support',senderUid:me.uid});},
     del:id=>deleteDoc(doc(db,'support_threads',uid,'messages',id)),emptyMsg:'لسه مفيش رسائل',snd:'notify'});
 }
 
@@ -3089,6 +3133,7 @@ async function grpSend(d){
   if(!d.isAdmin&&xVerdict(d.text))return xReject(d);
   const ref=doc(collection(db,'group_messages')),done=setDoc(ref,d);
   xTrack(ref.id,done);
+  done.then(()=>{wk('/notify',{kind:'group',title:d.isAdmin?'الأدمن في الجروب':((d.name||'طالب')+' في الجروب'),body:pushTxt(d.text,d),route:'#/community/group',aroute:'#/admin/group',senderUid:me&&me.uid});}).catch(()=>{});
   return done.then(()=>ref);
 }
 
@@ -3226,6 +3271,7 @@ acts['xc-go']=async el=>{
    ===================================================================== */
 (function(){
   try{
+    if(document.documentElement.classList.contains('lite'))return;
     var RM=window.matchMedia&&matchMedia('(prefers-reduced-motion:reduce)').matches;
     var seen=new WeakSet();
     var RIP='.btn,.bn,.opt,.gbtn,.track,.seg a,.send,.cbtn,.fcard,.vcard,.urow';
@@ -3348,7 +3394,10 @@ acts['xc-go']=async el=>{
 </script>
 
 <style>
-#ms-dev-btn{position:fixed;bottom:calc(18px + env(safe-area-inset-bottom));left:16px;z-index:9998;background:#1b2670;color:#fff;border:1px solid #e7ae3b;border-radius:14px;padding:10px 16px;font:600 14px inherit;box-shadow:0 5px 18px #101b4933}
+/* وضع خفيف للموبايل: بيوقف الأنيميشن المتكرر والبلور الثقيل */
+html.lite *,html.lite *::before,html.lite *::after{animation-iteration-count:1!important;backdrop-filter:none!important;-webkit-backdrop-filter:none!important}
+html.lite .auth::before,html.lite .auth::after,html.lite .fl,html.lite .orbit{display:none!important}
+html.lite::before{display:none!important}
 #ms-dev-overlay{position:fixed;inset:0;z-index:9999;background:#081126bb;display:none;align-items:center;justify-content:center;padding:20px}
 #ms-dev-overlay.ms-open{display:flex}
 #ms-dev-card{width:min(100%,360px);background:var(--card,#fff);color:var(--text,#0e1b2e);border:1px solid var(--gold,#e7ae3b);border-radius:20px;padding:20px;box-shadow:0 20px 60px #0005}
@@ -3356,7 +3405,6 @@ acts['xc-go']=async el=>{
 #ms-dev-card .ms-dev-name{padding:12px 14px;margin:8px 0;border-radius:12px;background:var(--paper,#f2f4f8);font-weight:600;text-align:center}
 #ms-dev-close{display:block;width:100%;margin-top:14px;padding:11px;border-radius:12px;background:var(--act,#2447c9);color:white;font-weight:600}
 </style>
-<button id="ms-dev-btn" type="button" aria-haspopup="dialog">المطورين</button>
 <div id="ms-dev-overlay" role="dialog" aria-modal="true" aria-labelledby="ms-dev-title">
  <div id="ms-dev-card"><h2 id="ms-dev-title">فريق التطوير</h2>
   <div class="ms-dev-name">داما</div><div class="ms-dev-name">أحمد</div><div class="ms-dev-name">ريتاج</div><div class="ms-dev-name">DAR team</div>
@@ -3364,7 +3412,7 @@ acts['xc-go']=async el=>{
  </div>
 </div>
 <script>
-(()=>{const b=document.getElementById('ms-dev-btn'),o=document.getElementById('ms-dev-overlay'),c=document.getElementById('ms-dev-close');if(!b||!o||!c)return;const close=()=>o.classList.remove('ms-open');b.addEventListener('click',()=>o.classList.add('ms-open'));c.addEventListener('click',close);o.addEventListener('click',e=>{if(e.target===o)close()});document.addEventListener('keydown',e=>{if(e.key==='Escape')close()});})();
+(()=>{const o=document.getElementById('ms-dev-overlay'),c=document.getElementById('ms-dev-close');if(!o||!c)return;const close=()=>o.classList.remove('ms-open');c.addEventListener('click',close);o.addEventListener('click',e=>{if(e.target===o)close()});document.addEventListener('keydown',e=>{if(e.key==='Escape')close()});})();
 </script>
 </body>
 </html>

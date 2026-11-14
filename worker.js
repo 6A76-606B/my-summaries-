@@ -3,6 +3,8 @@
    المسارات:
      POST /ai       أي طالب مسجّل: تصحيح أسئلة مقالية + توليد امتحانات (Gemini)
      POST /manager  الأدمن بس: مدير المنصة (بيفهم الأوامر وينفّذها على Firestore)
+     POST /register تسجيل جهاز للإشعارات (FCM) — محتاج FIREBASE_SA
+     POST /notify   إرسال إشعار فوري (رسالة جروب / رسالة دعم) — محتاج FIREBASE_SA
    + Cron كل دقيقة (اختياري): مراقبة الجروب التلقائية — محتاج FIREBASE_SA
 
    Secrets / Vars:
@@ -366,7 +368,7 @@ async function saToken(env) {
   if (saCache.token && Date.now() - saCache.at < 3000e3) return saCache.token;
   const sa = JSON.parse(env.FIREBASE_SA), now = Math.floor(Date.now() / 1000);
   const head = strB64u(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
-  const pl = strB64u(JSON.stringify({ iss: sa.client_email, scope: 'https://www.googleapis.com/auth/datastore', aud: 'https://oauth2.googleapis.com/token', iat: now, exp: now + 3600 }));
+  const pl = strB64u(JSON.stringify({ iss: sa.client_email, scope: 'https://www.googleapis.com/auth/cloud-platform', aud: 'https://oauth2.googleapis.com/token', iat: now, exp: now + 3600 }));
   const pem = sa.private_key.replace(/-----[A-Z ]+-----/g, '').replace(/\s+/g, '');
   const key = await crypto.subtle.importKey('pkcs8', Uint8Array.from(atob(pem), c => c.charCodeAt(0)), { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['sign']);
   const sig = bytesToB64u(new Uint8Array(await crypto.subtle.sign('RSASSA-PKCS1-v1_5', key, te.encode(head + '.' + pl))));
@@ -410,13 +412,91 @@ ${rules.map(r => '- ' + clip(r.text, 300)).join('\n')}`;
   await fsMerge(ctx, 'manager/state', patch);
 }
 
+
+/* ---------------------------- الإشعارات (FCM) ---------------------------- */
+const okRoute = r => (typeof r === 'string' && /^#\/[\w\-\/]{0,120}$/.test(r)) ? r : '';
+async function topicOp(sa, op, topic, tokens) {
+  const url = op === 'add' ? 'https://iid.googleapis.com/iid/v1:batchAdd' : 'https://iid.googleapis.com/iid/v1:batchRemove';
+  try { await fetch(url, { method: 'POST', headers: { Authorization: 'Bearer ' + sa.token, 'Content-Type': 'application/json', access_token_auth: 'true' }, body: JSON.stringify({ to: '/topics/' + topic, registration_tokens: tokens }) }); } catch { /* مش حرج */ }
+}
+async function fcmSend(env, sa, target, n) {
+  const message = {
+    ...target,
+    notification: { title: n.title, body: n.body },
+    data: { route: n.route, aroute: n.aroute, senderUid: n.senderUid },
+    android: { priority: 'HIGH', ttl: '3600s', notification: { channel_id: 'default', sound: 'default' } },
+  };
+  const r = await fetch(`https://fcm.googleapis.com/v1/projects/${env.FIREBASE_PROJECT_ID}/messages:send`, { method: 'POST', headers: { Authorization: 'Bearer ' + sa.token, 'Content-Type': 'application/json' }, body: JSON.stringify({ message }) });
+  const j = await r.json().catch(() => ({}));
+  return { ok: r.ok, status: r.status, error: j.error && (j.error.status || j.error.message) };
+}
+async function handlePush(req, env, path) {
+  if (!env.FIREBASE_SA || !env.FIREBASE_PROJECT_ID) return err(500, 'push_not_configured');
+  const token = (req.headers.get('Authorization') || '').replace(/^Bearer\s+/i, '');
+  let claims;
+  try { claims = await verifyIdToken(token, env.FIREBASE_PROJECT_ID); }
+  catch (e) { return err(401, 'unauthorized', e.message); }
+  let b;
+  try { b = await req.json(); } catch { return err(400, 'bad_json'); }
+  let sa;
+  try { sa = { pid: env.FIREBASE_PROJECT_ID, token: await saToken(env) }; } catch (e) { return err(500, 'sa_token_failed', e.message); }
+  const adminMail = String(env.ADMIN_EMAIL || DEFAULT_ADMIN).toLowerCase();
+  let admin = claims.email_verified === true && String(claims.email || '').toLowerCase() === adminMail;
+  if (!admin) { try { admin = !!(await fsGet({ pid: env.FIREBASE_PROJECT_ID, token }, 'admins/' + claims.sub)); } catch { admin = false; } }
+
+  if (path === '/register') {
+    const tok = b && b.token;
+    if (typeof tok !== 'string' || tok.length < 40 || tok.length > 4096 || /[\/\s]/.test(tok)) return err(400, 'bad_token');
+    const docPath = 'fcm_tokens/' + encodeURIComponent(tok);
+    if (b.remove) {
+      const cur = await fsGet(sa, docPath).catch(() => null);
+      if (cur && cur.uid === claims.sub) {
+        await topicOp(sa, 'remove', 'group', [tok]); await topicOp(sa, 'remove', 'admins', [tok]);
+        await fsDel(sa, docPath).catch(() => {});
+      }
+      return json({ ok: true, removed: true });
+    }
+    await fsMerge(sa, docPath, { uid: claims.sub, admin, updatedAt: new Date() });
+    await topicOp(sa, 'add', 'group', [tok]);
+    await topicOp(sa, admin ? 'add' : 'remove', 'admins', [tok]);
+    return json({ ok: true });
+  }
+
+  /* /notify */
+  const kind = b && b.kind;
+  const n = { title: clip(String(b.title || 'My summaries'), 60), body: clip(String(b.body || ''), 140), route: okRoute(b.route), aroute: okRoute(b.aroute), senderUid: claims.sub };
+  if (kind === 'group') {
+    const r = await fcmSend(env, sa, { topic: 'group' }, n);
+    return json({ ok: r.ok, sent: r.ok ? 1 : 0, error: r.error });
+  }
+  if (kind === 'support_to_admin') {
+    const r = await fcmSend(env, sa, { topic: 'admins' }, n);
+    return json({ ok: r.ok, sent: r.ok ? 1 : 0, error: r.error });
+  }
+  if (kind === 'support_to_student') {
+    if (!admin) return err(403, 'forbidden');
+    const uid = String(b.uid || '');
+    if (!uid || uid.length > 128) return err(400, 'bad_uid');
+    const rows = await fsQuery(sa, 'fcm_tokens', { where: ['uid', 'EQUAL', uid], limit: 20 });
+    let sent = 0;
+    for (const row of rows) {
+      const r = await fcmSend(env, sa, { token: decodeURIComponent(row.id) }, n);
+      if (r.ok) sent++;
+      else if (r.status === 404 || /UNREGISTERED|NOT_FOUND|INVALID_ARGUMENT/.test(String(r.error))) await fsDel(sa, 'fcm_tokens/' + row.id).catch(() => {});
+    }
+    return json({ ok: true, sent });
+  }
+  return err(400, 'bad_kind');
+}
+
 /* ---------------------------- Router ---------------------------- */
 export default {
   async fetch(req, env, execCtx) {
     if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS });
     const path = new URL(req.url).pathname.replace(/\/+$/, '') || '/';
     if (req.method === 'GET' && path === '/') return json({ ok: true, service: 'my-summaries-worker' });
-    if (req.method !== 'POST' || !['/ai', '/manager'].includes(path)) return err(404, 'not_found');
+    if (req.method !== 'POST' || !['/ai', '/manager', '/register', '/notify'].includes(path)) return err(404, 'not_found');
+    if (path === '/register' || path === '/notify') return handlePush(req, env, path);
     if (!env.GEMINI_API_KEY || !env.FIREBASE_PROJECT_ID) return err(500, 'worker_not_configured');
     const token = (req.headers.get('Authorization') || '').replace(/^Bearer\s+/i, '');
     let claims;
