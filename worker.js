@@ -122,17 +122,21 @@ async function fsQuery(ctx, col, { orderBy, dir = 'DESCENDING', limit = 50, sele
 /* ---------------------------- Gemini ---------------------------- */
 const SAFETY = ['HARM_CATEGORY_HARASSMENT', 'HARM_CATEGORY_HATE_SPEECH', 'HARM_CATEGORY_SEXUALLY_EXPLICIT', 'HARM_CATEGORY_DANGEROUS_CONTENT'].map(category => ({ category, threshold: 'BLOCK_MEDIUM_AND_ABOVE' }));
 const MODEL_CHAIN = ['gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.6-flash', 'gemini-3.5-flash', 'gemini-3.5-flash-lite'];
-const retryable = e => [404, 429, 500, 502, 503, 504].includes(e.status) || /no longer available|not found|not supported|high demand|overloaded/i.test(String(e.message || ''));
-async function geminiOnce(env, model, { system, contents, json: wantJson, schema, maxTokens = 4096, temperature = 0.4 }) {
+const retryable = e => (e.status >= 500) || [404, 408, 429].includes(e.status) || e.timeout === true || /no longer available|not found|not supported|high demand|overloaded|timeout/i.test(String(e.message || ''));
+async function geminiOnce(env, model, { system, contents, json: wantJson, schema, maxTokens = 4096, temperature = 0.4 }, ms, think) {
   const generationConfig = { temperature, maxOutputTokens: maxTokens };
   if (wantJson) generationConfig.responseMimeType = 'application/json';
   if (schema) generationConfig.responseSchema = schema;
   if (/2\.5-flash/.test(model) && !/lite/.test(model)) generationConfig.thinkingConfig = { thinkingBudget: 0 };
+  else if (think && /^gemini-3/.test(model)) generationConfig.thinkingConfig = { thinkingLevel: 'low' };
   const body = { contents, generationConfig, safetySettings: SAFETY };
   if (system) body.systemInstruction = { parts: [{ text: system }] };
-  const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': env.GEMINI_API_KEY }, body: JSON.stringify(body),
-  });
+  let r;
+  try {
+    r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': env.GEMINI_API_KEY }, body: JSON.stringify(body), signal: AbortSignal.timeout(ms),
+    });
+  } catch (x) { const e = new Error('GEMINI_TIMEOUT_' + model); e.status = 504; e.timeout = true; throw e; }
   const j = await r.json().catch(() => ({}));
   if (!r.ok) { const e = new Error((j.error && j.error.message) || ('GEMINI_' + r.status)); e.status = r.status; throw e; }
   const parts = (j.candidates && j.candidates[0] && j.candidates[0].content && j.candidates[0].content.parts) || [];
@@ -140,16 +144,23 @@ async function geminiOnce(env, model, { system, contents, json: wantJson, schema
   if (!text) { const e = new Error((j.promptFeedback && j.promptFeedback.blockReason) || 'empty_reply'); e.status = 502; throw e; }
   return text;
 }
-/* بيجرّب الموديل المضبوط، ولو مشغول أو مش متاح بيكمّل على اللي بعده */
+/* بيجرّب الموديل المضبوط، ولو مشغول أو مش متاح أو اتأخر بيكمّل على اللي بعده (حدّ زمني لكل محاولة + حدّ إجمالي) */
 async function gemini(env, opts) {
+  const { perMs = 20000, totalMs = 50000 } = opts, t0 = Date.now();
   const first = env.GEMINI_MODEL ? [env.GEMINI_MODEL] : [];
   const chain = [...first, ...MODEL_CHAIN.filter(m => m !== env.GEMINI_MODEL)];
   let last;
   for (const model of chain) {
-    try { return await geminiOnce(env, model, opts); }
+    const left = totalMs - (Date.now() - t0);
+    if (left < 4000) break;
+    const ms = Math.min(perMs, left);
+    try {
+      try { return await geminiOnce(env, model, opts, ms, true); }
+      catch (e) { if (e.status === 400 && /thinking/i.test(String(e.message))) return await geminiOnce(env, model, opts, ms, false); throw e; }
+    }
     catch (e) { last = e; if (!retryable(e)) throw e; }
   }
-  throw last;
+  throw last || Object.assign(new Error('GEMINI_TIMEOUT'), { status: 504 });
 }
 const parseJSON = t => { const m = String(t || '').match(/\{[\s\S]*\}/); if (!m) throw new Error('BAD_JSON'); return JSON.parse(m[0]); };
 const geminiStatus = e => (e.status === 429 ? 429 : 502);
@@ -352,7 +363,7 @@ ${ctx.cfg.rules.map(r => `${r.id} | ${r.on ? 'نعم' : 'لا'} | ${clip(r.text,
   const contents = b.messages.slice(-8).map(m => ({ role: m && m.role === 'assistant' ? 'model' : 'user', parts: [{ text: clip(m && m.content, 2500) }] })).filter(c => c.parts[0].text);
   if (!contents.length || contents[contents.length - 1].role !== 'user') return err(400, 'bad_request');
   let plan;
-  try { plan = parseJSON(await gemini(env, { system: MGR_SYSTEM + '\n\n' + data, contents, json: true, maxTokens: 8192, temperature: 0.2 })); }
+  try { plan = parseJSON(await gemini(env, { system: MGR_SYSTEM + '\n\n' + data, contents, json: true, maxTokens: 8192, temperature: 0.2, perMs: 14000, totalMs: 45000 })); }
   catch (e) { return err(e.message === 'BAD_JSON' ? 502 : geminiStatus(e), e.message === 'BAD_JSON' ? 'bad_reply' : (e.status === 429 ? 'quota' : 'gemini_error'), e.message); }
   const results = await runActions(ctx, plan.actions);
   return json({ ok: true, reply: clip(plan.reply, 3000), results });
@@ -382,7 +393,7 @@ async function handleExam(req, env, claims) {
   if (!text && !imgs.length) return err(400, 'empty_input');
   const parts = [{ text: (b.hasAnswers ? 'المدخل فيه الإجابات الصحيحة، استخدمها.' : 'المدخل ممكن يكون من غير إجابات، حلّ الأسئلة بنفسك.') + (text ? '\n\nنص الامتحان:\n' + text : '\n\nالامتحان في الصور المرفقة.') }, ...imgs];
   let out;
-  try { out = parseJSON(await gemini(env, { system: EXAM_SYSTEM, contents: [{ role: 'user', parts }], json: true, schema: EXAM_SCHEMA, maxTokens: 8192, temperature: 0.2 })); }
+  try { out = parseJSON(await gemini(env, { system: EXAM_SYSTEM, contents: [{ role: 'user', parts }], json: true, schema: EXAM_SCHEMA, maxTokens: 8192, temperature: 0.2, perMs: 28000, totalMs: 52000 })); }
   catch (e) { return err(e.message === 'BAD_JSON' ? 502 : geminiStatus(e), e.message === 'BAD_JSON' ? 'bad_reply' : (e.status === 429 ? 'quota' : 'gemini_error'), e.message); }
   const qs = (Array.isArray(out.questions) ? out.questions : []).slice(0, 60).map(q => ({
     type: q && q.type === 'mcq' ? 'mcq' : 'short', q: clip(q && q.q, 800),
@@ -434,7 +445,7 @@ async function monitor(env) {
 ${rules.map(r => '- ' + clip(r.text, 300)).join('\n')}`;
     const user = fresh.map(m => `${m.id} | ${m.uid} | ${clip(m.name, 30)} | ${clip(m.text, 300).replace(/\s+/g, ' ')}`).join('\n');
     try {
-      const plan = parseJSON(await gemini(env, { system: sys, contents: [{ role: 'user', parts: [{ text: 'id | uid | الاسم | النص\n' + user }] }], json: true, maxTokens: 2048, temperature: 0 }));
+      const plan = parseJSON(await gemini(env, { system: sys, contents: [{ role: 'user', parts: [{ text: 'id | uid | الاسم | النص\n' + user }] }], json: true, maxTokens: 2048, temperature: 0, perMs: 15000, totalMs: 25000 }));
       const acts = (Array.isArray(plan.actions) ? plan.actions : []).filter(a => a && a.msgId && fresh.some(m => m.id === a.msgId && m.uid === a.uid));
       let saved = 0;
       for (const a of acts.slice(0, 8)) {
