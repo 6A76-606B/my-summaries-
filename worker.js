@@ -12,7 +12,7 @@
      GEMINI_API_KEY        (secret)  مطلوب
      FIREBASE_PROJECT_ID   (var)     مطلوب
      ADMIN_EMAIL           (var)     اختياري، الافتراضي markogoerge123321@gmail.com
-     GEMINI_MODEL          (var)     اختياري، الافتراضي gemini-2.5-flash
+     GEMINI_MODEL          (var)     اختياري، الافتراضي gemini-3.8-flash (مع بدائل تلقائية)
      FIREBASE_SA           (secret)  اختياري: JSON بتاع Service Account (للمراقبة التلقائية بس)
    ===================================================================== */
 
@@ -121,8 +121,9 @@ async function fsQuery(ctx, col, { orderBy, dir = 'DESCENDING', limit = 50, sele
 
 /* ---------------------------- Gemini ---------------------------- */
 const SAFETY = ['HARM_CATEGORY_HARASSMENT', 'HARM_CATEGORY_HATE_SPEECH', 'HARM_CATEGORY_SEXUALLY_EXPLICIT', 'HARM_CATEGORY_DANGEROUS_CONTENT'].map(category => ({ category, threshold: 'BLOCK_MEDIUM_AND_ABOVE' }));
-async function gemini(env, { system, contents, json: wantJson, schema, maxTokens = 4096, temperature = 0.4 }) {
-  const model = env.GEMINI_MODEL || 'gemini-2.5-flash';
+const MODEL_CHAIN = ['gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.6-flash', 'gemini-3.5-flash', 'gemini-3.5-flash-lite'];
+const retryable = e => [404, 429, 500, 502, 503, 504].includes(e.status) || /no longer available|not found|not supported|high demand|overloaded/i.test(String(e.message || ''));
+async function geminiOnce(env, model, { system, contents, json: wantJson, schema, maxTokens = 4096, temperature = 0.4 }) {
   const generationConfig = { temperature, maxOutputTokens: maxTokens };
   if (wantJson) generationConfig.responseMimeType = 'application/json';
   if (schema) generationConfig.responseSchema = schema;
@@ -138,6 +139,17 @@ async function gemini(env, { system, contents, json: wantJson, schema, maxTokens
   const text = parts.map(p => p.text || '').join('').trim();
   if (!text) { const e = new Error((j.promptFeedback && j.promptFeedback.blockReason) || 'empty_reply'); e.status = 502; throw e; }
   return text;
+}
+/* بيجرّب الموديل المضبوط، ولو مشغول أو مش متاح بيكمّل على اللي بعده */
+async function gemini(env, opts) {
+  const first = env.GEMINI_MODEL ? [env.GEMINI_MODEL] : [];
+  const chain = [...first, ...MODEL_CHAIN.filter(m => m !== env.GEMINI_MODEL)];
+  let last;
+  for (const model of chain) {
+    try { return await geminiOnce(env, model, opts); }
+    catch (e) { last = e; if (!retryable(e)) throw e; }
+  }
+  throw last;
 }
 const parseJSON = t => { const m = String(t || '').match(/\{[\s\S]*\}/); if (!m) throw new Error('BAD_JSON'); return JSON.parse(m[0]); };
 const geminiStatus = e => (e.status === 429 ? 429 : 502);
